@@ -4,16 +4,20 @@ from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
-    QSpacerItem,
 )
+
+from eon.ai.gemini_client import GeminiClient
+from eon.core.database import ConversationStore
 
 
 class MainWindow(QMainWindow):
@@ -32,7 +36,15 @@ class MainWindow(QMainWindow):
         self.resize(1200, 760)
         self.setMinimumSize(900, 600)
 
-        self.setStyleSheet(f"""
+        self.gemini = GeminiClient()
+        self.store = ConversationStore()
+
+        self.conversation_id = None
+        self.is_waiting = False
+        self.has_started_chat = False
+
+        self.setStyleSheet(
+            f"""
             QMainWindow, QWidget {{
                 background-color: {self.BG};
                 color: {self.TEXT};
@@ -87,11 +99,9 @@ class MainWindow(QMainWindow):
                 background-color: #9ba6ff;
             }}
 
-            QPushButton#small {{
-                padding: 7px 10px;
-                background-color: transparent;
-                border: none;
-                color: {self.MUTED};
+            QPushButton#primary:disabled {{
+                background-color: #41496f;
+                color: #aeb4cc;
             }}
 
             QLineEdit {{
@@ -128,7 +138,8 @@ class MainWindow(QMainWindow):
             QScrollBar::sub-line:vertical {{
                 height: 0;
             }}
-        """)
+            """
+        )
 
         self._build_ui()
         self._show_welcome()
@@ -164,12 +175,21 @@ class MainWindow(QMainWindow):
 
         new_chat.clicked.connect(self.new_conversation)
         conversations.clicked.connect(self.show_conversations)
-        memory.clicked.connect(lambda: self.show_notice(
-            "Memory", "Persistent memory will be implemented in a later phase."
-        ))
-        tools.clicked.connect(lambda: self.show_notice(
-            "Agent tools", "Approved agent tools will be implemented later."
-        ))
+
+        memory.clicked.connect(
+            lambda: self.show_notice(
+                "Memory",
+                "Persistent personal memory will be implemented later.",
+            )
+        )
+
+        tools.clicked.connect(
+            lambda: self.show_notice(
+                "Agent tools",
+                "Approved agent tools will be implemented later.",
+            )
+        )
+
         settings.clicked.connect(self.show_settings)
 
         side.addWidget(brand)
@@ -191,8 +211,8 @@ class MainWindow(QMainWindow):
         content_layout.setSpacing(16)
 
         header = QHBoxLayout()
-
         title_box = QVBoxLayout()
+
         heading = QLabel("Your workspace")
         heading.setObjectName("heading")
 
@@ -202,12 +222,15 @@ class MainWindow(QMainWindow):
         title_box.addWidget(heading)
         title_box.addWidget(subtitle)
 
-        self.status = QLabel("●  UI ready · Gemini not connected")
+        self.status = QLabel("●  Gemini client initialized")
         self.status.setObjectName("muted")
 
         header.addLayout(title_box)
         header.addStretch()
-        header.addWidget(self.status, alignment=Qt.AlignmentFlag.AlignTop)
+        header.addWidget(
+            self.status,
+            alignment=Qt.AlignmentFlag.AlignTop,
+        )
 
         # Conversation area
         self.chat_area = QWidget()
@@ -228,7 +251,8 @@ class MainWindow(QMainWindow):
         self.scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.scroll.setStyleSheet(f"""
+        self.scroll.setStyleSheet(
+            f"""
             QScrollArea#chatScroll {{
                 background-color: {self.BG};
                 border: none;
@@ -237,19 +261,22 @@ class MainWindow(QMainWindow):
                 background-color: {self.BG};
                 border: none;
             }}
-        """)
+            """
+        )
         self.scroll.viewport().setAutoFillBackground(True)
         self.scroll.setWidget(self.chat_area)
 
         # Message composer
         composer = QFrame()
-        composer.setStyleSheet(f"""
+        composer.setStyleSheet(
+            f"""
             QFrame {{
                 background-color: {self.SIDEBAR};
                 border: 1px solid {self.BORDER};
                 border-radius: 14px;
             }}
-        """)
+            """
+        )
 
         composer_layout = QHBoxLayout(composer)
         composer_layout.setContentsMargins(12, 10, 12, 10)
@@ -260,23 +287,23 @@ class MainWindow(QMainWindow):
         self.message_input.setClearButtonEnabled(True)
         self.message_input.returnPressed.connect(self.send_message)
 
-        send_button = QPushButton("Send  ↗")
-        send_button.setObjectName("primary")
-        send_button.clicked.connect(self.send_message)
+        self.send_button = QPushButton("Send  ↗")
+        self.send_button.setObjectName("primary")
+        self.send_button.clicked.connect(self.send_message)
 
         composer_layout.addWidget(self.message_input, 1)
-        composer_layout.addWidget(send_button)
+        composer_layout.addWidget(self.send_button)
 
-        footer = QLabel(
-            "Prototype mode · Messages are not saved between sessions."
+        self.footer = QLabel(
+            "Gemini enabled · Conversations saved locally."
         )
-        footer.setObjectName("muted")
-        footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.footer.setObjectName("muted")
+        self.footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         content_layout.addLayout(header)
         content_layout.addWidget(self.scroll, 1)
         content_layout.addWidget(composer)
-        content_layout.addWidget(footer)
+        content_layout.addWidget(self.footer)
 
         main_layout.addWidget(sidebar)
         main_layout.addWidget(content, 1)
@@ -323,6 +350,13 @@ class MainWindow(QMainWindow):
 
         self.chat_layout.addWidget(welcome_box)
 
+    def _clear_chat(self):
+        while self.chat_layout.count():
+            item = self.chat_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
     def _add_message(self, text, sender):
         row = QWidget()
         row.setStyleSheet("background: transparent;")
@@ -338,11 +372,12 @@ class MainWindow(QMainWindow):
         bubble.setMaximumWidth(650)
         bubble.setSizePolicy(
             QSizePolicy.Policy.Preferred,
-            QSizePolicy.Policy.Minimum
+            QSizePolicy.Policy.Minimum,
         )
 
         if sender == "user":
-            bubble.setStyleSheet("""
+            bubble.setStyleSheet(
+                """
                 QLabel {
                     background-color: #252b40;
                     color: #f1f3f9;
@@ -350,11 +385,13 @@ class MainWindow(QMainWindow):
                     border-radius: 14px;
                     padding: 13px 16px;
                 }
-            """)
+                """
+            )
             row_layout.addStretch()
             row_layout.addWidget(bubble)
         else:
-            bubble.setStyleSheet(f"""
+            bubble.setStyleSheet(
+                f"""
                 QLabel {{
                     background-color: {self.SIDEBAR};
                     color: {self.TEXT};
@@ -362,11 +399,13 @@ class MainWindow(QMainWindow):
                     border-radius: 14px;
                     padding: 13px 16px;
                 }}
-            """)
+                """
+            )
             row_layout.addWidget(bubble)
             row_layout.addStretch()
 
         self.chat_layout.addWidget(row)
+
         QTimer.singleShot(
             0,
             lambda: self.scroll.verticalScrollBar().setValue(
@@ -375,46 +414,150 @@ class MainWindow(QMainWindow):
         )
 
     def send_message(self):
+        if self.is_waiting:
+            return
+
         message = self.message_input.text().strip()
         if not message:
             return
 
-        # Remove the welcome screen on the first message.
-        while self.chat_layout.count():
-            item = self.chat_layout.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
+        # Create a conversation when the first message is sent.
+        if not self.has_started_chat:
+            self.conversation_id = self.store.create_conversation(
+                message[:50]
+            )
+            self._clear_chat()
+            self.has_started_chat = True
 
         self._add_message(message, "user")
         self.message_input.clear()
 
-        self._add_message(
-            "The interface is working. Gemini has not been connected yet.",
-            "assistant",
-        )
+        try:
+            self.store.add_message(
+                self.conversation_id,
+                "user",
+                message,
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Storage error",
+                f"Could not save your message:\n{error}",
+            )
+            return
+
+        self.is_waiting = True
+        self.send_button.setEnabled(False)
+        self.message_input.setEnabled(False)
+        self.status.setText("●  EON is thinking...")
+        self.footer.setText("Waiting for Gemini response...")
+
+        QApplication.processEvents()
+
+        try:
+            response = self.gemini.generate_response(message)
+
+            self._add_message(response, "assistant")
+            self.store.add_message(
+                self.conversation_id,
+                "assistant",
+                response,
+            )
+            self.status.setText("●  Gemini response received")
+
+        except Exception as error:
+            self._add_message(
+                f"Sorry, I couldn't get a response from Gemini.\n\n{error}",
+                "assistant",
+            )
+            self.status.setText("●  Gemini request failed")
+
+        finally:
+            self.is_waiting = False
+            self.send_button.setEnabled(True)
+            self.message_input.setEnabled(True)
+            self.message_input.setFocus()
+            self.footer.setText(
+                "Gemini enabled · Conversations saved locally."
+            )
 
     def new_conversation(self):
-        while self.chat_layout.count():
-            item = self.chat_layout.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
+        if self.is_waiting:
+            return
 
+        self._clear_chat()
+        self.conversation_id = None
+        self.has_started_chat = False
         self._show_welcome()
         self.message_input.clear()
-
-    def show_notice(self, title, message):
-        self._add_message(f"{title}: {message}", "assistant")
+        self.status.setText("●  Gemini client initialized")
+        self.footer.setText(
+            "Gemini enabled · Conversations saved locally."
+        )
 
     def show_conversations(self):
-        self.show_notice(
+        conversations = self.store.list_conversations()
+
+        if not conversations:
+            QMessageBox.information(
+                self,
+                "Conversations",
+                "No saved conversations yet.",
+            )
+            return
+
+        labels = [
+            f"{item['title']} ({item['message_count']} messages)"
+            for item in conversations
+        ]
+
+        selected, accepted = QInputDialog.getItem(
+            self,
             "Conversations",
-            "Conversation history will be added when persistence is implemented.",
+            "Select a conversation to open:",
+            labels,
+            0,
+            False,
         )
+
+        if not accepted:
+            return
+
+        selected_index = labels.index(selected)
+        conversation = conversations[selected_index]
+        conversation_id = conversation["id"]
+
+        self._clear_chat()
+        self.conversation_id = conversation_id
+        self.has_started_chat = True
+
+        messages = self.store.get_messages(conversation_id)
+
+        if not messages:
+            self._show_welcome()
+        else:
+            for message in messages:
+                self._add_message(
+                    message["content"],
+                    message["role"],
+                )
+
+        self.status.setText("●  Conversation loaded")
+        self.footer.setText(
+            "Conversation loaded from local SQLite storage."
+        )
+
+    def show_notice(self, title, message):
+        QMessageBox.information(self, title, message)
 
     def show_settings(self):
         self.show_notice(
             "Settings",
             "Configuration and API settings will be added in a later step.",
+        )
+
+    def show_conversations_placeholder(self):
+        self.show_notice(
+            "Conversations",
+            "Your saved conversations are available through the Conversations menu.",
         )
